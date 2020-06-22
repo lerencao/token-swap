@@ -1,0 +1,6 @@
+[package]
+name = "token_swap"
+description = ""
+
+[profile]
+skip_stdlib_deps = true
