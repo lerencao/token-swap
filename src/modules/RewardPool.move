@@ -1,8 +1,4 @@
 address 0x2 {
-module Staker {
-    resource struct Staked<StakeToken, RewardToken> { }
-}
-
 module RewardPool {
     use 0x1::Token;
     use 0x1::Block;
@@ -78,6 +74,8 @@ module RewardPool {
     }
 
     ////////// User parts. ////////
+
+    /// accept this kind of pool.
     public fun enter_pool<StakeToken, RewardToken>(signer: &signer) {
         move_to(signer, Staked<StakeToken, RewardToken> { staked: Vector::empty() });
     }
@@ -117,18 +115,80 @@ module RewardPool {
         );
         let staking = Vector::borrow_mut(&mut user_staked.staked, location);
         let pool = borrow_global_mut<T<StakeToken, RewardToken>>(reward_pool);
+        // update reward first
+        _update_reward(pool, staking);
         _stake(pool, staking, to_stake);
+    }
+
+    public fun unstake<StakeToken, RewardToken>(
+        signer: &signer,
+        reward_pool: address,
+        share: u128,
+    ): Token::Token<StakeToken> acquires Staked, T {
+        let user_staked = borrow_global_mut<Staked<StakeToken, RewardToken>>(
+            Signer::address_of(signer),
+        );
+        let location = {
+            let location = locate_staking(&user_staked.staked, reward_pool);
+            assert(Option::is_some(&location), 400);
+            Option::extract(&mut location)
+        };
+        let staking = Vector::borrow_mut(&mut user_staked.staked, location);
+        let pool = borrow_global_mut<T<StakeToken, RewardToken>>(reward_pool);
+        _update_reward(pool, staking);
+        _unstake(pool, staking, share)
+    }
+
+    /// WithddrawRewards withdraw all earned token.
+    public fun withdraw_rewards<StakeToken, RewardToken>(
+        signer: &signer,
+        reward_pool: address,
+    ): Token::Token<RewardToken> acquires Staked, T {
+        let user_staked = borrow_global_mut<Staked<StakeToken, RewardToken>>(
+            Signer::address_of(signer),
+        );
+        let location = {
+            let location = locate_staking(&user_staked.staked, reward_pool);
+            assert(Option::is_some(&location), 400);
+            Option::extract(&mut location)
+        };
+        let staking = Vector::borrow_mut(&mut user_staked.staked, location);
+        let pool = borrow_global_mut<T<StakeToken, RewardToken>>(reward_pool);
+        _update_reward(pool, staking);
+        _withdraw_rewards(pool, staking)
+    }
+
+    public fun exit<StakeToken, RewardToken>(
+        signer: &signer,
+        reward_pool: address,
+    ): (Token::Token<StakeToken>, Token::Token<RewardToken>) acquires Staked, T {
+        let user_staked = borrow_global_mut<Staked<StakeToken, RewardToken>>(
+            Signer::address_of(signer),
+        );
+        let location = {
+            let location = locate_staking(&user_staked.staked, reward_pool);
+            assert(Option::is_some(&location), 400);
+            Option::extract(&mut location)
+        };
+        let staking = Vector::swap_remove(&mut user_staked.staked, location);
+        let pool = borrow_global_mut<T<StakeToken, RewardToken>>(reward_pool);
+        _update_reward(pool, &mut staking);
+        let (s, r) = _exit(pool, &mut staking);
+        (s, r)
     }
 
     /// Calculate reward earned.
     public fun earned<StakeToken, RewardToken>(reward_pool: address, account: address): u128
     acquires T, Staked {
         let user_staked = borrow_global<Staked<StakeToken, RewardToken>>(account);
-        let location = locate_staking(&user_staked.staked, reward_pool);
-        assert(Option::is_some(&location), 1000);
-        let location = Option::extract(&mut location);
+        let location = {
+            let location = locate_staking(&user_staked.staked, reward_pool);
+            assert(Option::is_some(&location), 400);
+            Option::extract(&mut location)
+        };
+        let staking = Vector::borrow(&user_staked.staked, location);
         let pool = borrow_global<T<StakeToken, RewardToken>>(reward_pool);
-        _earned<StakeToken, RewardToken>(Vector::borrow(&user_staked.staked, location), pool)
+        _earned<StakeToken, RewardToken>(staking, pool)
     }
 
     public fun staking_info<StakeToken, RewardToken>(
@@ -144,16 +204,46 @@ module RewardPool {
         }
     }
 
+    /// internal function of Stake action, caller should update_reward first.
     fun _stake<StakeToken, RewardToken>(
         pool: &mut T<StakeToken, RewardToken>,
         staking: &mut Staking,
         to_stake: Token::Token<StakeToken>,
     ) {
-        // we should update reward before update state
-        _update_reward(pool, staking);
         // update user's stake info and move the staking token to pool.
         staking.stake = staking.stake + Token::share(&to_stake);
         Token::deposit(&mut pool.stakes, to_stake);
+    }
+
+    /// internal function of Unstake action, caller should update_reward first.
+    fun _unstake<StakeToken, RewardToken>(
+        pool: &mut T<StakeToken, RewardToken>,
+        staking: &mut Staking,
+        share: u128,
+    ): Token::Token<StakeToken> {
+        staking.stake = staking.stake - share;
+        Token::withdraw_share(&mut pool.stakes, share)
+    }
+
+    /// internal function of WithdrawReward action, caller should update_reward first.
+    fun _withdraw_rewards<StakeToken, RewardToken>(
+        pool: &mut T<StakeToken, RewardToken>,
+        staking: &mut Staking,
+    ): Token::Token<RewardToken> {
+        assert(staking.reward_info.reward > 0, 1000);
+        let my_share = staking.reward_info.reward;
+        staking.reward_info.reward = 0;
+        Token::withdraw_share(&mut pool.remaining_rewards, my_share)
+    }
+
+    fun _exit<StakeToken, RewardToken>(
+        pool: &mut T<StakeToken, RewardToken>,
+        staking: &mut Staking,
+    ): (Token::Token<StakeToken>, Token::Token<RewardToken>) {
+        let rewards = _withdraw_rewards(pool, staking);
+        let all_stakes = staking.stake;
+        let staked_tokens = _unstake(pool, staking, all_stakes);
+        (staked_tokens, rewards)
     }
 
     fun locate_staking(staked: &vector<Staking>, pool_address: address): Option::Option<u64> {
@@ -192,9 +282,8 @@ module RewardPool {
         reward_pool: &T<StakeToken, RewardToken>,
     ): u128 {
         let reward_per_token = _reward_per_token<StakeToken, RewardToken>(reward_pool);
-        // TODO: merge into one
-        let not_reward = reward_per_token - user_stake.reward_info.reward_per_token_paid;
-        user_stake.stake * not_reward + user_stake.reward_info.reward
+        user_stake.reward_info.reward +
+            user_stake.stake * (reward_per_token - user_stake.reward_info.reward_per_token_paid)
     }
 
     fun _reward_per_token<StakeToken, RewardToken>(pool: &T<StakeToken, RewardToken>): u128 {
